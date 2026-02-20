@@ -13,6 +13,7 @@ from flask_cors import CORS
 import os
 import uuid
 from werkzeug.utils import secure_filename
+import json
 
 # Optional HuggingFace imports (initialized lazily)
 try:
@@ -177,6 +178,60 @@ def predict_food(image_path):
     return _predict_by_filename(image_path, FOOD_CALORIES)
 
 
+def call_groq(food_name: str, user_goal: str | None):
+    """
+    Call Groq chat completion to get structured nutrition/advice for a given food
+    Returns parsed JSON dict or None on failure.
+    """
+    try:
+        from groq import Groq
+    except Exception:
+        return None
+
+    try:
+        groq = Groq()
+        messages = [
+            {"role": "system", "content": "You are a nutrition assistant. Provide concise, factual answers in JSON only."},
+            {
+                "role": "user",
+                "content": (
+                    f"Given the food '{food_name}', return its calories per 100g (number), "
+                    "a short list (3-6) of addons/side-items that would help the user reach their fitness goal faster, "
+                    "and a one-sentence advice. The user's fitness goal: '" + (user_goal or "unspecified") + "'."
+                ),
+            },
+        ]
+
+        response = groq.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=messages,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "food_nutrition",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "food_name": {"type": "string"},
+                            "calories_per_100g": {"type": "number"},
+                            "addons": {"type": "array", "items": {"type": "string"}},
+                            "advice": {"type": "string"}
+                        },
+                        "required": ["food_name", "calories_per_100g", "addons", "advice"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+        )
+
+        content = response.choices[0].message.content or "{}"
+        parsed = json.loads(content)
+        return parsed
+    except Exception:
+        return None
+
+
 def _predict_by_filename(image_path, FOOD_CALORIES):
     fname = os.path.basename(image_path).lower()
     for key in FOOD_CALORIES.keys():
@@ -334,12 +389,33 @@ class Food(Resource):
         db.session.add(entry)
         db.session.commit()
 
-        return {
+        # If the detected food is rice, enrich with Groq for calories and addons
+        groq_data = None
+        try:
+            if food_name and "rice" in food_name.lower():
+                # load user's fitness goal if available
+                profile = UserProfile.query.filter_by(user_id=current_user_id).first()
+                user_goal = profile.fitness_goal if profile else None
+                groq_data = call_groq(food_name, user_goal)
+                if groq_data and isinstance(groq_data, dict):
+                    # update calories if provided
+                    c = groq_data.get("calories_per_100g")
+                    if isinstance(c, (int, float)):
+                        entry.calories = float(c)
+                        db.session.commit()
+        except Exception:
+            groq_data = None
+
+        resp = {
             "entry_id": entry.entry_id,
             "food_name": food_name,
-            "calories": calories,
+            "calories": entry.calories,
             "confidence": confidence,
-        }, 201
+        }
+        if groq_data:
+            resp["groq"] = groq_data
+
+        return resp, 201
 
     @jwt_required()
     def get(self):
